@@ -13,31 +13,276 @@
 # limitations under the License.
 from __future__ import annotations
 
+import importlib
 import inspect
 import io
 import json
 import os
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Type
 
-from huggingface_hub import hf_hub_download
-
-from paddlenlp import __version__
-from paddlenlp.transformers.configuration_utils import PretrainedConfig
-from paddlenlp.transformers.model_utils import PretrainedModel
-from paddlenlp.utils.downloader import (
-    COMMUNITY_MODEL_PREFIX,
-    get_path_from_url_with_filelock,
-    url_file_exists,
-)
-from paddlenlp.utils.import_utils import import_module
-from paddlenlp.utils.log import logger
-
-from ..utils import resolve_cache_dir
+from ...utils.download import resolve_file_path
+from ...utils.import_utils import import_module
+from ...utils.log import logger
+from ..configuration_utils import PretrainedConfig
+from ..model_utils import PretrainedModel
 
 __all__ = [
     "AutoConfig",
 ]
+
+CONFIG_MAPPING_NAMES = OrderedDict(
+    [
+        ("albert", "AlbertConfig"),
+        ("artist", "ArtistConfig"),
+        ("bart", "BartConfig"),
+        ("bert", "BertConfig"),
+        ("bigbird", "BigBirdConfig"),
+        ("bit", "BitConfig"),
+        ("blenderbot", "BlenderbotConfig"),
+        ("blenderbot_small", "BlenderbotSmallConfig"),
+        ("blip", "BlipConfig"),
+        ("blip2", "Blip2Config"),
+        ("bloom", "BloomConfig"),
+        ("chatglm", "ChatGLMConfig"),
+        ("chatglm_v2", "ChatGLMv2Config"),
+        ("chinesebert", "ChineseBertConfig"),
+        ("chineseclip", "ChineseCLIPConfig"),
+        ("clap", "ClapConfig"),
+        ("clip", "CLIPConfig"),
+        ("codegen", "CodeGenConfig"),
+        ("convbert", "ConvBertConfig"),
+        ("ctrl", "CTRLConfig"),
+        ("dallebart", "DalleBartConfig"),
+        ("deberta", "DebertaConfig"),
+        ("debertav2", "DebertaV2Config"),
+        ("deepseek_v2", "DeepseekV2Config"),
+        ("deepseek_v3", "DeepseekV3Config"),
+        ("distilbert", "DistilBertConfig"),
+        ("dpt", "DPTConfig"),
+        ("electra", "ElectraConfig"),
+        ("ernie", "ErnieConfig"),
+        ("ernie_code", "ErnieCodeConfig"),
+        ("ernie_ctm", "ErnieCtmConfig"),
+        ("ernie_doc", "ErnieDocConfig"),
+        ("ernie_gram", "ErnieGramConfig"),
+        ("ernie_layout", "ErnieLayoutConfig"),
+        ("ernie_m", "ErnieMConfig"),
+        ("ernie_vil", "ErnieViLConfig"),
+        ("fnet", "FNetConfig"),
+        ("funnel", "FunnelConfig"),
+        ("gau_alpha", "GAUAlphaConfig"),
+        ("gemma", "GemmaConfig"),
+        ("glm", "GLMConfig"),
+        ("gpt", "GPTConfig"),
+        ("gptj", "GPTJConfig"),
+        ("jamba", "JambaConfig"),
+        ("layoutlm", "LayoutLMConfig"),
+        ("layoutlmv2", "LayoutLMv2Config"),
+        ("layoutxlm", "LayoutXLMConfig"),
+        ("llama", "LlamaConfig"),
+        ("luke", "LukeConfig"),
+        ("mamba", "MambaConfig"),
+        ("mbart", "MBartConfig"),
+        ("megatronbert", "MegatronBertConfig"),
+        ("minigpt4", "MiniGPT4Config"),
+        ("mistral", "MistralConfig"),
+        ("mixtral", "MixtralConfig"),
+        ("mobilebert", "MobileBertConfig"),
+        ("mpnet", "MPNetConfig"),
+        ("mt5", "MT5Config"),
+        ("nezha", "NeZhaConfig"),
+        ("nystromformer", "NystromformerConfig"),
+        ("opt", "OPTConfig"),
+        ("pegasus", "PegasusConfig"),
+        ("ppminilm", "PPMiniLMConfig"),
+        ("prophetnet", "ProphetNetConfig"),
+        ("qwen", "QWenConfig"),
+        ("qwen2", "Qwen2Config"),
+        ("qwen2_moe", "Qwen2MoeConfig"),
+        ("reformer", "ReformerConfig"),
+        ("rembert", "RemBertConfig"),
+        ("roberta", "RobertaConfig"),
+        ("roformer", "RoFormerConfig"),
+        ("roformerv2", "RoFormerv2Config"),
+        ("rw", "RWConfig"),
+        ("skep", "SkepConfig"),
+        ("speecht5", "SpeechT5Config"),
+        ("squeezebert", "SqueezeBertConfig"),
+        ("t5", "T5Config"),
+        ("tinybert", "TinyBertConfig"),
+        ("unified_transformer", "UnifiedTransformerConfig"),
+        ("unimo", "UNIMOConfig"),
+        ("visualglm", "VisualGLMConfig"),
+        ("xlm", "XLMConfig"),
+        ("xlm-roberta", "XLMRobertaConfig"),
+        ("xlnet", "XLNetConfig"),
+        ("yuan", "YuanConfig"),
+    ]
+)
+
+
+MODEL_NAMES_MAPPING = OrderedDict(
+    # Base model mapping
+    [
+        ("albert", "Albert"),
+        ("artist", "Artist"),
+        ("bart", "Bart"),
+        ("bert", "Bert"),
+        ("bigbird", "BigBird"),
+        ("bit", "Bit"),
+        ("blenderbot", "Blenderbot"),
+        ("blenderbot_small", "BlenderbotSmall"),
+        ("blip", "Blip"),
+        ("blip2", "Blip2"),
+        ("bloom", "Bloom"),
+        ("chatglm", "ChatGLM"),
+        ("chatglm_v2", "ChatGLMv2"),
+        ("chinesebert", "ChineseBert"),
+        ("chineseclip", "ChineseCLIPText"),
+        ("clap", "CLAP"),
+        ("clip", "CLIP"),
+        ("codegen", "CodeGen"),
+        ("convbert", "ConvBert"),
+        ("ctrl", "CTRL"),
+        ("dallebart", "DalleBart"),
+        ("deberta", "Deberta"),
+        ("debertav2", "DebertaV2"),
+        ("deepseek_v2", "DeepseekV2"),
+        ("deepseek_v3", "DeepseekV3"),
+        ("distilbert", "DistilBert"),
+        ("dpt", "DPT"),
+        ("electra", "Electra"),
+        ("ernie", "Ernie"),
+        ("ernie_code", "ErnieCode"),
+        ("ernie_ctm", "ErnieCtm"),
+        ("ernie_doc", "ErnieDoc"),
+        ("ernie_gram", "ErnieGram"),
+        ("ernie_layout", "ErnieLayout"),
+        ("ernie_m", "ErnieM"),
+        ("ernie_vil", "ErnieViL"),
+        ("fnet", "FNet"),
+        ("funnel", "Funnel"),
+        ("gau_alpha", "GAUAlpha"),
+        ("gemma", "Gemma"),
+        ("glm", "GLM"),
+        ("gpt", "GPT"),
+        ("gptj", "GPTJ"),
+        ("jamba", "Jamba"),
+        ("layoutlm", "LayoutLM"),
+        ("layoutlmv2", "LayoutLMv2"),
+        ("layoutxlm", "LayoutXLM"),
+        ("llama", "Llama"),
+        ("luke", "Luke"),
+        ("mamba", "Mamba"),
+        ("mbart", "MBart"),
+        ("megatronbert", "MegatronBert"),
+        ("minigpt4", "MiniGPT4"),
+        ("mistral", "Mistral"),
+        ("mixtral", "Mixtral"),
+        ("mobilebert", "MobileBert"),
+        ("mpnet", "MPNet"),
+        ("mt5", "MT5"),
+        ("nezha", "NeZha"),
+        ("nystromformer", "Nystromformer"),
+        ("opt", "OPT"),
+        ("pegasus", "Pegasus"),
+        ("ppminilm", "PPMiniLM"),
+        ("prophetnet", "ProphetNet"),
+        ("qwen", "QWen"),
+        ("qwen2", "Qwen2"),
+        ("qwen2_moe", "Qwen2Moe"),
+        ("reformer", "Reformer"),
+        ("rembert", "RemBert"),
+        ("roberta", "Roberta"),
+        ("roformer", "RoFormer"),
+        ("roformerv2", "RoFormerv2"),
+        ("rw", "RW"),
+        ("skep", "Skep"),
+        ("speecht5", "SpeechT5"),
+        ("squeezebert", "SqueezeBert"),
+        ("t5", "T5"),
+        ("tinybert", "TinyBert"),
+        ("unified_transformer", "UnifiedTransformer"),
+        ("unimo", "UNIMO"),
+        ("visualglm", "VisualGLM"),
+        ("xlm", "XLM"),
+        ("xlm-roberta", "XLMRoberta"),
+        ("xlnet", "XLNet"),
+        ("yuan", "Yuan"),
+    ]
+)
+
+
+def config_class_to_model_type(config):
+    """Converts a config class name to the corresponding model type"""
+    for key, cls in CONFIG_MAPPING_NAMES.items():
+        if cls == config:
+            return key
+    # if key not found check in extra content
+    for key, cls in CONFIG_MAPPING._extra_content.items():
+        if cls.__name__ == config:
+            return key
+    return None
+
+
+class _LazyConfigMapping(OrderedDict):
+    """
+    A dictionary that lazily load its values when they are requested.
+    """
+
+    def __init__(self, mapping):
+        self._mapping = mapping
+        self._extra_content = {}
+        self._modules = {}
+
+    def __getitem__(self, key):
+        # NOTE: (changwenbin) This is to enable the qwen2_vl language model to use qwen2 reasoning optimization
+        if key == "qwen2_vl":
+            key = "qwen2"
+        if key in self._extra_content:
+            return self._extra_content[key]
+        if key not in self._mapping:
+            raise KeyError(key)
+        value = self._mapping[key]
+        module_name = model_type_to_module_name(key)
+        if module_name not in self._modules:
+            self._modules[module_name] = importlib.import_module(
+                f".{module_name}.configuration", "paddlenlp.transformers"
+            )
+        if hasattr(self._modules[module_name], value):
+            return getattr(self._modules[module_name], value)
+
+        # Some of the mappings have entries model_type -> config of another model type. In that case we try to grab the
+        # object at the top level.
+        transformers_module = importlib.import_module("paddlenlp")
+        return getattr(transformers_module, value)
+
+    def keys(self):
+        return list(self._mapping.keys()) + list(self._extra_content.keys())
+
+    def values(self):
+        return [self[k] for k in self._mapping.keys()] + list(self._extra_content.values())
+
+    def items(self):
+        return [(k, self[k]) for k in self._mapping.keys()] + list(self._extra_content.items())
+
+    def __iter__(self):
+        return iter(list(self._mapping.keys()) + list(self._extra_content.keys()))
+
+    def __contains__(self, item):
+        return item in self._mapping or item in self._extra_content
+
+    def register(self, key, value, exist_ok=False):
+        """
+        Register a new configuration in this mapping.
+        """
+        if key in self._mapping.keys() and not exist_ok:
+            raise ValueError(f"'{key}' is already used by a Transformers config, pick another name.")
+        self._extra_content[key] = value
+
+
+CONFIG_MAPPING = _LazyConfigMapping(CONFIG_MAPPING_NAMES)
 
 
 def get_configurations() -> Dict[str, List[Type[PretrainedConfig]]]:
@@ -73,6 +318,12 @@ def get_configurations() -> Dict[str, List[Type[PretrainedConfig]]]:
     return mappings
 
 
+def model_type_to_module_name(key):
+    """Converts a config key to the corresponding module."""
+    key = key.replace("-", "_")
+    return key
+
+
 class AutoConfig(PretrainedConfig):
     """
     AutoConfig is a generic config class that will be instantiated as one of the
@@ -106,6 +357,17 @@ class AutoConfig(PretrainedConfig):
         model_name = architectures[0]
         model_class = import_module(f"paddlenlp.transformers.{model_name}")
 
+        # To make AutoConfig support loading config with custom model_class
+        # which is not in paddlenlp.transformers. Using "model_type" to load
+        # here actually conforms to what PretrainedConfig doc describes.
+        if model_class is None and "model_type" in config:
+            model_type = config["model_type"]
+            # MAPPING_NAMES is a dict with item like ('llama', [LlamaConfig, PretrainedConfig])
+            for config_class in cls.MAPPING_NAMES[model_type]:
+                if config_class is not PretrainedConfig:
+                    model_config_class = config_class
+                    return model_config_class
+
         assert inspect.isclass(model_class) and issubclass(
             model_class, PretrainedModel
         ), f"<{model_class}> should be a PretarinedModel class, but <{type(model_class)}>"
@@ -129,7 +391,7 @@ class AutoConfig(PretrainedConfig):
         return cls(**config)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, from_hf_hub=False, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
         """
         Creates an instance of `AutoConfig`. Related resources are loaded by
         specifying name of a built-in pretrained model, or a community-contributed
@@ -159,10 +421,6 @@ class AutoConfig(PretrainedConfig):
             config = AutoConfig.from_pretrained("bert-base-uncased")
             config.save_pretrained('./bert-base-uncased')
         """
-        subfolder = kwargs.pop("subfolder", None)
-        cache_dir = resolve_cache_dir(
-            pretrained_model_name_or_path, from_hf_hub=from_hf_hub, cache_dir=kwargs.pop("cache_dir", None)
-        )
 
         if not cls.name2class:
             cls.name2class = {}
@@ -178,62 +436,66 @@ class AutoConfig(PretrainedConfig):
                 pretrained_model_name_or_path, *model_args, **kwargs
             )
 
-        # From local dir path
-        elif os.path.isdir(pretrained_model_name_or_path):
-            config_file = os.path.join(pretrained_model_name_or_path, cls.config_file)
-            if not os.path.exists(config_file):
-                # try to load legacy config file
-                legacy_config_file = os.path.join(pretrained_model_name_or_path, cls.legacy_config_file)
-                if not os.path.exists(legacy_config_file):
-                    raise ValueError(
-                        f"config file<{cls.config_file}> or legacy config file<{cls.legacy_config_file}> not found"
-                    )
+        subfolder = kwargs.get("subfolder", "")
+        if subfolder is None:
+            subfolder = ""
+        from_aistudio = kwargs.pop("from_aistudio", False)
+        from_hf_hub = kwargs.pop("from_hf_hub", False)
+        cache_dir = kwargs.pop("cache_dir", None)
 
-                logger.warning(f"loading legacy config file<{cls.legacy_config_file}> ...")
-                config_file = legacy_config_file
-
+        config_file = resolve_file_path(
+            pretrained_model_name_or_path,
+            [cls.config_file, cls.legacy_config_file],
+            subfolder,
+            cache_dir=cache_dir,
+            from_hf_hub=from_hf_hub,
+            from_aistudio=from_aistudio,
+        )
+        config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+        if "model_type" in config_dict:
+            try:
+                config_class = CONFIG_MAPPING[config_dict["model_type"]]
+            except KeyError:
+                raise ValueError(
+                    f"The checkpoint you are trying to load has model type `{config_dict['model_type']}` "
+                    "but Transformers does not recognize this architecture. This could be because of an "
+                    "issue with the checkpoint, or because your version of Transformers is out of date."
+                )
+            return config_class.from_dict(config_dict, **unused_kwargs)
+        elif "model_type" not in config_dict and config_file is not None and os.path.exists(config_file):
             config_class = cls._get_config_class_from_config(pretrained_model_name_or_path, config_file)
             logger.info("We are using %s to load '%s'." % (config_class, pretrained_model_name_or_path))
             if config_class is cls:
                 return cls.from_file(config_file)
-            return config_class.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
-        elif from_hf_hub:
-            file = hf_hub_download(
-                repo_id=pretrained_model_name_or_path,
-                filename=cls.config_file,
-                cache_dir=cache_dir,
-                subfolder=subfolder,
-                library_name="PaddleNLP",
-                library_version=__version__,
-            )
-            # from local dir path
-            return cls.from_pretrained(os.path.dirname(file))
-
-        # Assuming from community-contributed pretrained models
+            return config_class.from_pretrained(config_file, *model_args, **kwargs)
+        elif config_file is None:
+            # Fallback: use pattern matching on the string.
+            # We go from longer names to shorter names to catch roberta before bert (for instance)
+            for pattern in sorted(CONFIG_MAPPING.keys(), key=len, reverse=True):
+                if pattern in str(pretrained_model_name_or_path):
+                    return CONFIG_MAPPING[pattern].from_dict(config_dict, **unused_kwargs)
         else:
-            # add support for legacy config file ...
-            community_config_path = "/".join([COMMUNITY_MODEL_PREFIX, pretrained_model_name_or_path, cls.config_file])
-            if not url_file_exists(community_config_path):
-                legacy_community_config_path = "/".join(
-                    [COMMUNITY_MODEL_PREFIX, pretrained_model_name_or_path, cls.legacy_config_file]
-                )
-                if not url_file_exists(legacy_community_config_path):
-                    raise RuntimeError(
-                        f"Can't load Config for '{pretrained_model_name_or_path}'.\n"
-                        f"Please make sure that '{pretrained_model_name_or_path}' is:\n"
-                        "- a correct model-identifier of built-in pretrained models,\n"
-                        "- or a correct model-identifier of community-contributed pretrained models,\n"
-                        "- or the correct path to a directory containing relevant config files.\n"
-                    )
-                logger.warning(f"loading legacy config file<{cls.legacy_config_file}> ...")
-                community_config_path = legacy_community_config_path
+            raise RuntimeError(
+                f"Can't load config for '{pretrained_model_name_or_path}'.\n"
+                f"Please make sure that '{pretrained_model_name_or_path}' is:\n"
+                "- a correct model-identifier of built-in pretrained models,\n"
+                "- or a correct model-identifier of community-contributed pretrained models,\n"
+                "- or the correct path to a directory containing relevant config files.\n"
+            )
 
-            resolved_config_file = get_path_from_url_with_filelock(community_config_path, cache_dir)
+    @staticmethod
+    def register(model_type, config, exist_ok=False):
+        """
+        Register a new configuration for this class.
 
-            config_class = cls._get_config_class_from_config(pretrained_model_name_or_path, resolved_config_file)
-            logger.info("We are using %s to load '%s'." % (config_class, pretrained_model_name_or_path))
-            if config_class is cls:
-                return cls.from_file(resolved_config_file, **kwargs)
-
-            return config_class.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        Args:
+            model_type (`str`): The model type like "bert" or "gpt".
+            config ([`PretrainedConfig`]): The config to register.
+        """
+        if issubclass(config, PretrainedConfig) and config.model_type != model_type:
+            raise ValueError(
+                "The config you are passing has a `model_type` attribute that is not consistent with the model type "
+                f"you passed (config has {config.model_type} and you passed {model_type}. Fix one of those so they "
+                "match!"
+            )
+        CONFIG_MAPPING.register(model_type, config, exist_ok=exist_ok)

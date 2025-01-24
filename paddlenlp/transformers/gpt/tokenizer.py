@@ -32,7 +32,10 @@ __all__ = [
 PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES = {
     "gpt-cpm-large-cn": 1024,
     "gpt-cpm-small-cn-distill": 1024,
+    "gpt3-175B-en": 1024,
+    "gpt3-89B-en": 1024,
     "gpt3-13B-en": 1024,
+    "gpt3-6.7B-en": 1024,
     "gpt3-1.3B-en": 1024,
     "gpt2-xl-en": 1024,
     "gpt2-large-en": 1024,
@@ -199,7 +202,7 @@ class GPTChineseTokenizer(PretrainedTokenizer):
             return [self._convert_token_to_id(token) for token in tokens]
     '''
 
-    def convert_ids_to_tokens(self, ids):
+    def convert_ids_to_tokens(self, ids, skip_special_tokens=False):
         """
         Converts a single index or a sequence of indices to a token or a
         sequence of tokens.
@@ -341,6 +344,7 @@ class GPTTokenizer(PretrainedTokenizer):
             "gpt3-175B-en": gpt_vocab_link,
             "gpt3-89B-en": gpt_vocab_link,
             "gpt3-13B-en": gpt_vocab_link,
+            "gpt3-6.7B-en": gpt_vocab_link,
             "gpt3-1.3B-en": gpt_vocab_link,
             "gpt2-xl-en": gpt_vocab_link,
             "gpt2-large-en": gpt_vocab_link,
@@ -352,6 +356,7 @@ class GPTTokenizer(PretrainedTokenizer):
             "gpt3-175B-en": gpt_merges_link,
             "gpt3-89B-en": gpt_merges_link,
             "gpt3-13B-en": gpt_merges_link,
+            "gpt3-6.7B-en": gpt_merges_link,
             "gpt3-1.3B-en": gpt_merges_link,
             "gpt2-xl-en": gpt_merges_link,
             "gpt2-large-en": gpt_merges_link,
@@ -364,6 +369,7 @@ class GPTTokenizer(PretrainedTokenizer):
         "gpt3-175B-en": {},
         "gpt3-89B-en": {},
         "gpt3-13B-en": {},
+        "gpt3-6.7B-en": {},
         "gpt3-1.3B-en": {},
         "gpt2-xl-en": {},
         "gpt2-large-en": {},

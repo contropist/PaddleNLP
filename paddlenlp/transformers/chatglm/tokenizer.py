@@ -14,7 +14,7 @@
 
 """Tokenization classes for ChatGLM."""
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 import numpy as np
 import sentencepiece as spm
@@ -34,7 +34,7 @@ class ChatGLMTokenizer(PretrainedTokenizer):
 
     resource_files_names = {"vocab_file": "ice_text.model"}
     max_model_input_sizes = {"THUDM/chatglm-6b": 2048, "THUDM/chatglm-6b-v1.1": 2048}
-    model_input_names = ["input_ids", "attention_mask", "position_ids"]
+    model_input_names = ["input_ids", "attention_mask"]
     pretrained_resource_files_map = {
         "model_file": {
             "THUDM/chatglm-6b": "https://paddlenlp.bj.bcebos.com/models/community/THUDM/chatglm-6b/ice_text.model",
@@ -57,6 +57,7 @@ class ChatGLMTokenizer(PretrainedTokenizer):
         num_image_tokens=20000,
         **kwargs
     ) -> None:
+        kwargs["additional_special_tokens"] = kwargs.pop("additional_special_tokens", []) + [gmask_token]
         super().__init__(
             pad_token=pad_token,
             unk_token=unk_token,
@@ -217,13 +218,15 @@ class ChatGLMTokenizer(PretrainedTokenizer):
         max_length: Optional[int] = None,
         padding_strategy=PaddingStrategy.DO_NOT_PAD,
         pad_to_multiple_of: Optional[int] = None,
+        padding_side: Optional[Literal["right", "left"]] = None,
         return_attention_mask: Optional[bool] = None,
     ) -> dict:
         # Load from model defaults
         if return_attention_mask is None:
             return_attention_mask = "attention_mask" in self.model_input_names or "attention_mask" in encoded_inputs
 
-        assert self.padding_side == "left"
+        padding_side = padding_side if padding_side is not None else self.padding_side
+        assert padding_side == "left"
         required_input = encoded_inputs[self.model_input_names[0]]
         seq_length = len(required_input)
 
@@ -245,7 +248,6 @@ class ChatGLMTokenizer(PretrainedTokenizer):
                 attention_mask = np.ones((1, seq_length, seq_length))
                 attention_mask = np.tril(attention_mask)
                 attention_mask[:, :, :context_length] = 1
-                attention_mask = (attention_mask < 0.5).astype("int64")
                 encoded_inputs["attention_mask"] = attention_mask
 
             if "position_ids" not in encoded_inputs:
@@ -270,7 +272,7 @@ class ChatGLMTokenizer(PretrainedTokenizer):
                     encoded_inputs["attention_mask"],
                     pad_width=[(0, 0), (difference, 0), (difference, 0)],
                     mode="constant",
-                    constant_values=1,
+                    constant_values=0,
                 )
             if "token_type_ids" in encoded_inputs:
                 encoded_inputs["token_type_ids"] = [self.pad_token_type_id] * difference + encoded_inputs[

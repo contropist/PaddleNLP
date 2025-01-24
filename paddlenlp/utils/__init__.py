@@ -17,14 +17,16 @@ import contextlib
 import paddle
 
 from .batch_sampler import *
-from .env import CONFIG_NAME, LEGACY_CONFIG_NAME
-from .import_utils import install_package, uninstall_package
+from .env import CONFIG_NAME, GENERATION_CONFIG_NAME, LEGACY_CONFIG_NAME
+from .import_utils import *
+from .infohub import infohub
 from .initializer import to
+from .optimizer import *
 from .serialization import load_torch
 
 # hack impl for EagerParamBase to function
 # https://github.com/PaddlePaddle/Paddle/blob/fa44ea5cf2988cd28605aedfb5f2002a63018df7/python/paddle/nn/layer/layers.py#L2077
-paddle.fluid.framework.EagerParamBase.to = to
+paddle.framework.io.EagerParamBase.to = to
 
 
 @contextlib.contextmanager

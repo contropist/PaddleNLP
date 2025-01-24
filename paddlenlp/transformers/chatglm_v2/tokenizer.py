@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Union
+import re
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from sentencepiece import SentencePieceProcessor
 
@@ -34,7 +36,18 @@ class SPTokenizer:
         self.pad_id: int = self.sp_model.unk_id()
         assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
 
-        special_tokens = ["[MASK]", "[gMASK]", "[sMASK]", "sop", "eop"]
+        special_tokens = [
+            "[MASK]",
+            "[gMASK]",
+            "[sMASK]",
+            "sop",
+            "eop",
+            "<|system|>",
+            "<|user|>",
+            "<|assistant|>",
+            "<|observation|>",
+        ]
+
         self.special_tokens = {}
         self.index_special_tokens = {}
         for token in special_tokens:
@@ -42,8 +55,24 @@ class SPTokenizer:
             self.index_special_tokens[self.n_words] = token
             self.n_words += 1
 
-    def tokenize(self, s: str):
-        return self.sp_model.EncodeAsPieces(s)
+        # add eos/pad/unk token to special_token_expression
+        all_special_tokens = list(self.special_tokens.keys()) + ["</s>", "<unk>"]
+        self.special_token_expression = "|".join([re.escape(token) for token in all_special_tokens])
+
+    def tokenize(self, s: str, encode_special_tokens=False):
+        if encode_special_tokens:
+            last_index = 0
+            t = []
+            for match in re.finditer(self.special_token_expression, s):
+                if last_index < match.start():
+                    t.extend(self.sp_model.EncodeAsPieces(s[last_index : match.start()]))
+                t.append(s[match.start() : match.end()])
+                last_index = match.end()
+            if last_index < len(s):
+                t.extend(self.sp_model.EncodeAsPieces(s[last_index:]))
+            return t
+        else:
+            return self.sp_model.EncodeAsPieces(s)
 
     def encode(self, s: str, bos: bool = False, eos: bool = False) -> List[int]:
         assert type(s) is str
@@ -83,7 +112,8 @@ class ChatGLMv2Tokenizer(PretrainedTokenizer):
         }
     }
 
-    def __init__(self, vocab_file, padding_side="left", **kwargs):
+    # always encode special tokens, eg: </s>, [gMASK], [MASK] ...
+    def __init__(self, vocab_file, padding_side="left", encode_special_tokens=True, **kwargs):
         super().__init__(padding_side=padding_side, **kwargs)
         self.name = "ChatGLMv2Tokenizer"
 
@@ -92,8 +122,10 @@ class ChatGLMv2Tokenizer(PretrainedTokenizer):
         self.special_tokens = {
             "<bos>": self.tokenizer.bos_id,
             "<eos>": self.tokenizer.eos_id,
+            "<unk>": self.tokenizer.pad_id,
             "<pad>": self.tokenizer.pad_id,
         }
+        self.encode_special_tokens = encode_special_tokens
 
     def get_command(self, token):
         if token in self.special_tokens:
@@ -128,7 +160,7 @@ class ChatGLMv2Tokenizer(PretrainedTokenizer):
         return vocab
 
     def _tokenize(self, text, **kwargs):
-        return self.tokenizer.tokenize(text)
+        return self.tokenizer.tokenize(text, encode_special_tokens=self.encode_special_tokens)
 
     def _convert_token_to_id(self, token):
         """Converts a token (str) in an id using the vocab."""
@@ -211,59 +243,59 @@ class ChatGLMv2Tokenizer(PretrainedTokenizer):
         max_length: Optional[int] = None,
         padding_strategy: PaddingStrategy = PaddingStrategy.DO_NOT_PAD,
         pad_to_multiple_of: Optional[int] = None,
+        padding_side: Optional[Literal["right", "left"]] = None,
         return_attention_mask: Optional[bool] = None,
     ) -> dict:
         """
         Pad encoded inputs (on left/right and up to predefined length or max length in the batch)
-
         Args:
             encoded_inputs:
                 Dictionary of tokenized inputs (`List[int]`) or batch of tokenized inputs (`List[List[int]]`).
             max_length: maximum length of the returned list and optionally padding length (see below).
                 Will truncate by taking into account the special tokens.
             padding_strategy: PaddingStrategy to use for padding.
-
                 - PaddingStrategy.LONGEST Pad to the longest sequence in the batch
                 - PaddingStrategy.MAX_LENGTH: Pad to the max length (default)
                 - PaddingStrategy.DO_NOT_PAD: Do not pad
-                The tokenizer padding sides are defined in self.padding_side:
+                The tokenizer padding sides are defined in `padding_side` argument:
 
                     - 'left': pads on the left of the sequences
                     - 'right': pads on the right of the sequences
             pad_to_multiple_of: (optional) Integer if set will pad the sequence to a multiple of the provided value.
                 This is especially useful to enable the use of Tensor Core on NVIDIA hardware with compute capability
-                `>= 7.5` (Volta).
+                >= 7.5 (Volta).
+            padding_side: (optional) The side on which the model should have padding applied.
+                Should be selected between ['right', 'left'].
+                Default value is picked from the class attribute of the same name.
             return_attention_mask:
                 (optional) Set to False to avoid returning attention mask (default: set to model specifics)
         """
         # Load from model defaults
-        assert self.padding_side == "left"
+        padding_side = padding_side if padding_side is not None else self.padding_side
+        assert padding_side == "left"
 
         required_input = encoded_inputs[self.model_input_names[0]]
         seq_length = len(required_input)
 
-        if padding_strategy == PaddingStrategy.LONGEST:
-            max_length = len(required_input)
-
-        if max_length is not None and pad_to_multiple_of is not None and (max_length % pad_to_multiple_of != 0):
-            max_length = ((max_length // pad_to_multiple_of) + 1) * pad_to_multiple_of
-
-        needs_to_be_padded = padding_strategy != PaddingStrategy.DO_NOT_PAD and len(required_input) != max_length
-
-        # Initialize attention mask if not present.
-        if "attention_mask" not in encoded_inputs:
-            encoded_inputs["attention_mask"] = [1] * seq_length
-
         if "position_ids" not in encoded_inputs:
             encoded_inputs["position_ids"] = list(range(seq_length))
 
-        if needs_to_be_padded:
-            difference = max_length - len(required_input)
-
-            if "attention_mask" in encoded_inputs:
-                encoded_inputs["attention_mask"] = [0] * difference + encoded_inputs["attention_mask"]
-            if "position_ids" in encoded_inputs:
-                encoded_inputs["position_ids"] = [0] * difference + encoded_inputs["position_ids"]
-            encoded_inputs[self.model_input_names[0]] = [self.pad_token_id] * difference + required_input
+        super()._pad(
+            encoded_inputs=encoded_inputs,
+            max_length=max_length,
+            padding_strategy=padding_strategy,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_attention_mask=return_attention_mask,
+        )
 
         return encoded_inputs
+
+    def encode_chat_inputs(self, conversations: List[List[str, str]], context_data: Dict[str, Any] = {}):
+        # encode system
+        result = super().encode_chat_inputs(conversations, context_data=context_data)
+        if "system" in result:
+            result["system"] = self.get_prefix_tokens() + result["system"]
+        else:
+            result["conversations"][0][0] = self.get_prefix_tokens() + result["conversations"][0][0]
+
+        return result

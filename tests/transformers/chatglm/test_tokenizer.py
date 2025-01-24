@@ -16,6 +16,7 @@
 import unittest
 
 import numpy as np
+from parameterized import parameterized
 
 from paddlenlp.transformers import ChatGLMTokenizer
 from paddlenlp.transformers.tokenizer_utils import PretrainedTokenizer
@@ -31,6 +32,7 @@ class ChatGLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
     tokenizer_class = ChatGLMTokenizer
     from_pretrained_vocab_key = "model_file"
+    test_decode_token = True
 
     def get_tokenizer(self, **kwargs) -> PretrainedTokenizer:
         tokenizer = ChatGLMTokenizer.from_pretrained("THUDM/chatglm-6b", **kwargs)
@@ -179,23 +181,23 @@ class ChatGLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         # test single string max_length padding
         self.assertEqual(out_s["input_ids"].shape[-1], 30)
         self.assertTrue(pad_token_id in out_s["input_ids"])
-        self.assertTrue(1 in out_s["attention_mask"][..., 0])
+        self.assertTrue(0 in out_s["attention_mask"][..., 0])
 
         # s2
         # test automatic padding
         self.assertEqual(out_s2["input_ids"].shape[-1], 11)
         # long slice doesn't have padding
         self.assertFalse(pad_token_id in out_s2["input_ids"][0])
-        self.assertFalse(1 in out_s2["attention_mask"][0][..., 0])
+        self.assertFalse(0 in out_s2["attention_mask"][0][..., 0])
         # short slice does have padding
         self.assertTrue(pad_token_id in out_s2["input_ids"][1])
-        self.assertTrue(1 in out_s2["attention_mask"][1][..., 0])
+        self.assertTrue(0 in out_s2["attention_mask"][1][..., 0])
 
         # p
         # test single pair max_length padding
         self.assertEqual(out_p["input_ids"].shape[-1], 60)
         self.assertTrue(pad_token_id in out_p["input_ids"])
-        self.assertTrue(1 in out_p["attention_mask"][..., 0])
+        self.assertTrue(0 in out_p["attention_mask"][..., 0])
 
     def test_add_bos_token_slow(self):
         tokenizer = self.get_tokenizer()
@@ -216,7 +218,8 @@ class ChatGLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         self.assertGreaterEqual(len(self.tokenizer_class.pretrained_resource_files_map), 1)
         self.assertGreaterEqual(len(list(self.tokenizer_class.pretrained_resource_files_map.values())[0]), 1)
 
-    def test_encode_plus_with_padding(self):
+    @parameterized.expand([(True,), (False,)])
+    def test_encode_plus_with_padding(self, use_padding_as_call_kwarg: bool):
         tokenizers = self.get_tokenizers(do_lower_case=False)
         for tokenizer in tokenizers:
             with self.subTest(f"{tokenizer.__class__.__name__}"):
@@ -232,14 +235,32 @@ class ChatGLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
                 special_tokens_mask = encoded_sequence["special_tokens_mask"]
                 sequence_length = len(input_ids)
 
+                # Test right padding
+                tokenizer_kwargs_right = {
+                    "max_length": sequence_length + padding_size,
+                    "padding": "max_length",
+                    "return_special_tokens_mask": True,
+                }
+
+                if not use_padding_as_call_kwarg:
+                    tokenizer.padding_side = "right"
+                else:
+                    tokenizer_kwargs_right["padding_side"] = "right"
+                self.assertRaises(AssertionError, lambda: tokenizer.encode_plus(sequence, **tokenizer_kwargs_right))
+
                 # Test left padding
-                tokenizer.padding_side = "left"
-                left_padded_sequence = tokenizer.encode(
-                    sequence,
-                    max_length=sequence_length + padding_size,
-                    padding="max_length",
-                    return_special_tokens_mask=True,
-                )
+                tokenizer_kwargs_left = {
+                    "max_length": sequence_length + padding_size,
+                    "padding": "max_length",
+                    "return_special_tokens_mask": True,
+                }
+
+                if not use_padding_as_call_kwarg:
+                    tokenizer.padding_side = "left"
+                else:
+                    tokenizer_kwargs_left["padding_side"] = "left"
+
+                left_padded_sequence = tokenizer.encode_plus(sequence, **tokenizer_kwargs_left)
                 left_padded_input_ids = left_padded_sequence["input_ids"]
                 left_padded_special_tokens_mask = left_padded_sequence["special_tokens_mask"]
                 left_padded_sequence_length = len(left_padded_input_ids)
@@ -322,7 +343,7 @@ class ChatGLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
                     [x.tolist() for x in padded_features["attention_mask"]],
                     [
                         [[[0, 0, 0], [0, 0, 0], [0, 0, 1]]],
-                        [[[1, 1, 1], [1, 0, 0], [1, 0, 1]]],
+                        [[[0, 0, 0], [0, 0, 0], [0, 0, 1]]],
                     ],
                 )
 

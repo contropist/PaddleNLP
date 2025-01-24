@@ -146,7 +146,8 @@ class OPTConfig(PretrainedConfig):
         eos_token_id=2,
         enable_bias: bool = True,
         mp_degree: int = 1,
-        lm_shift_labels: bool = True,
+        fuse_attention_qkv=False,
+        fuse_attention_ffn=False,
         **kwargs,
     ):
         super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -166,4 +167,6 @@ class OPTConfig(PretrainedConfig):
 
         self.enable_bias = enable_bias
         self.mp_degree = mp_degree
-        self.lm_shift_labels = lm_shift_labels
+
+        self.fuse_attention_qkv = fuse_attention_qkv
+        self.fuse_attention_ffn = fuse_attention_ffn

@@ -135,7 +135,7 @@ class CodeGenAttention(Layer):
         attn_weights = attn_weights / self.scale_attn
         mask_value = paddle.to_tensor(-1e4, dtype=attn_weights.dtype)
         # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-        attn_weights = paddle.where(causal_mask, attn_weights, mask_value)
+        attn_weights = paddle.where(causal_mask.to("bool"), attn_weights, mask_value)
 
         if attention_mask is not None:
             # Apply the attention mask
@@ -313,7 +313,7 @@ class CodeGenModel(CodeGenPreTrainedModel):
     This model inherits from :class:`~paddlenlp.transformers.model_utils.PretrainedModel`.
     Refer to the superclass documentation for the generic methods.
     This model is also a Paddle `paddle.nn.Layer <https://www.paddlepaddle.org.cn/documentation
-    /docs/en/api/paddle/fluid/dygraph/layers/Layer_en.html>`__ subclass. Use it as a regular Paddle Layer
+    /docs/zh/api/paddle/nn/Layer_cn.html>`__ subclass. Use it as a regular Paddle Layer
     and refer to the Paddle documentation for all matter related to general usage and behavior.
     Args:
         config (:class:`CodeGenConfig`):

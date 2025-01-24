@@ -29,17 +29,27 @@ import random
 import re
 import threading
 import time
+from contextlib import contextmanager
 from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import paddle
+import paddle.distributed as dist
+from paddle.distributed import fleet
+from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.io import IterableDataset
 from paddle.optimizer.lr import LambdaDecay
 
+from paddlenlp.ops import Topology
+
+from ..trainer.argparser import strtobool
 from ..transformers.tokenizer_utils_base import BatchEncoding
+from ..utils.fault_tolerance import PDC_DOWNLOAD_ERROR
 from ..utils.import_utils import is_paddle_cuda_available, is_psutil_available
 from ..utils.log import logger
+from ..utils.pdc_sdk import PDCErrorCode, PDCErrorMessageMap, pdc_tool
+from .utils.helper import distributed_file
 
 __all__ = [
     "TrainOutput",
@@ -52,36 +62,137 @@ __all__ = [
     "get_last_checkpoint",
     "get_scheduler",
     "set_hyrbid_parallel_seed",
+    "log_trainer_start",
 ]
 
 
-def set_seed(seed: int = 1234, args=None):
-    if args is None:
-        random.seed(seed)
-        np.random.seed(seed)
-        paddle.seed(seed)
+def log_trainer_start():
+    if "MAIN_PROCESS_STARTED" not in os.environ:
+        start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        logger.info(f"The Training Main Process Started Successfully. time: {start_time}, pid: {os.getpid()}")
+        os.environ["MAIN_PROCESS_STARTED"] = "1"
 
-    if args is not None:
-        if args.use_hybrid_parallel:
-            from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 
-            random.seed(args.seed + args.dataset_rank)
-            np.random.seed(args.seed + args.dataset_rank)
-            paddle.seed(args.seed + args.dataset_rank)
+def _get_distributed_seeds(seed: int = 1234, topo: Topology = None):
+    """
+    Get the seeds from distributed environment strategy.
+    Args:
+        seed (:obj:`int`, `optional`, defaults to 1234): The seeds for initializing distributed training.
+        topo (:obj:`Topology`, `optional`, defaults to None): The topology of hybrid parallel in semi-auto mode.
+    Returns:
+        Tuple[int, int]: The global seed and local seed respectively.
+    """
 
-            # local_seed/ global_seed is used to control dropout in ModelParallel
-            local_seed = args.seed + 59999 + args.tensor_parallel_rank * 10 + args.pipeline_parallel_rank * 1000
-            global_seed = args.seed + 100003 + args.dataset_rank
-            tracker = get_rng_state_tracker()
+    # NOTE: For parameter init seed:
+    # seed: dp/mp_undistributed_paramter/sharding is same; others is different
+    # For compute seed(dropout):
+    # global seed: only mp group is same.
+    # local seed: all groups are different
+    hcg = None
+    if hasattr(fleet.fleet, "_hcg") and topo is None:
+        hcg = fleet.get_hybrid_communicate_group()
 
-            if "global_seed" not in tracker.states_:
-                tracker.add("global_seed", global_seed)
-            if "local_seed" not in tracker.states_:
-                tracker.add("local_seed", local_seed)
+    if topo is not None and paddle.distributed.get_world_size() > 1:
+        dp_rank = topo.dp_info.rank
+        dp_size = topo.dp_info.size
+
+        pp_rank = topo.pp_info.rank
+        pp_size = topo.pp_info.size
+
+        mp_rank = topo.mp_info.rank
+        mp_size = topo.mp_info.size
+
+        sep_rank = topo.sep_info.rank
+        sep_size = topo.sep_info.size
+
+        sharding_rank = topo.sharding_info.rank
+    elif hcg is not None and paddle.distributed.get_world_size() > 1:
+        # obtain rank message of hybrid parallel
+
+        mp_rank = hcg.get_model_parallel_rank()
+        mp_size = hcg.get_model_parallel_world_size()
+
+        if hasattr(hcg, "get_sep_parallel_rank"):
+            sep_rank = hcg.get_sep_parallel_rank()
+            sep_size = hcg.get_sep_parallel_world_size()
         else:
-            random.seed(args.seed)
-            np.random.seed(args.seed)
-            paddle.seed(args.seed)
+            sep_rank, sep_size = 0, 1
+
+        pp_rank = hcg.get_stage_id()
+        pp_size = hcg.get_pipe_parallel_world_size()
+
+        dp_rank = hcg.get_data_parallel_rank()
+        dp_size = hcg.get_data_parallel_world_size()
+
+        sharding_rank = hcg.get_sharding_parallel_rank()
+    else:
+        mp_rank, mp_size = 0, 1
+        sep_rank, sep_size = 0, 1
+        pp_rank, pp_size = 0, 1
+        dp_rank, dp_size = 0, 1
+        sharding_rank, _ = 0, 1
+
+    seed_offset = seed
+    global_seed = (
+        seed_offset
+        + sep_rank * (mp_size)
+        + pp_rank * (mp_size * sep_size)
+        + dp_rank * (mp_size * sep_size * pp_size)
+        + sharding_rank * (mp_size * sep_size * pp_size * dp_size)
+    )
+
+    seed_offset += paddle.distributed.get_world_size()
+    local_seed = (
+        seed_offset
+        + mp_rank
+        + sep_rank * (mp_size)
+        + pp_rank * (mp_size * sep_size)
+        + dp_rank * (mp_size * sep_size * pp_size)
+        + sharding_rank * (mp_size * sep_size * pp_size * dp_size)
+    )
+
+    # NOTE: the commented seeds are set only for precision validation
+    random_seed = seed + 100 * pp_rank
+
+    return global_seed, local_seed, random_seed
+
+
+def set_seed(seed: int = 1234, topo=None):
+    global_seed, local_seed, random_seed = _get_distributed_seeds(seed, topo)
+
+    tracker = get_rng_state_tracker()
+    if "global_seed" not in tracker.states_ and global_seed not in tracker.seeds_:
+        tracker.add("global_seed", global_seed)
+
+    if "local_seed" not in tracker.states_ and local_seed not in tracker.seeds_:
+        tracker.add("local_seed", local_seed)
+
+    paddle.seed(global_seed)
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+
+    logger.info(
+        "The global seed is set to {}, local seed is set to {} and "
+        "random seed is set to {}.".format(global_seed, local_seed, random_seed)
+    )
+
+
+def _switch_mode(mode="dynamic"):
+    assert mode in ["dynamic", "static"]
+    if mode == "dynamic":
+        paddle.disable_static()
+    else:
+        paddle.enable_static()
+
+
+@contextmanager
+def _exec_mode_guard(mode="dynamic"):
+    origin_mode = "dynamic" if paddle.in_dynamic_mode() else "static"
+    _switch_mode(mode)
+    try:
+        yield
+    finally:
+        _switch_mode(origin_mode)
 
 
 class ExplicitEnum(Enum):
@@ -132,7 +243,25 @@ PREFIX_CHECKPOINT_DIR = "checkpoint"
 _re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")
 
 
-def get_last_checkpoint(folder):
+def _check_checkpoint_files(
+    folder_path, world_size, ignore_save_lr_and_optim, skip_save_model_weight, remove_master_weight
+):
+    files = os.listdir(folder_path)
+    model_weight_files = [f for f in files if f.startswith(".model_weight")]
+    a = len(model_weight_files) == world_size
+    if not ignore_save_lr_and_optim:
+        b = True
+        if not skip_save_model_weight or not remove_master_weight:
+            master_weight_file = [f for f in files if f.startswith(".master_weight")]
+            b = len(master_weight_file) == world_size
+        optimizer_file = [f for f in files if f.startswith(".optimizer_weight")]
+        c = len(optimizer_file) == world_size
+        return a and b and c
+    else:
+        return a
+
+
+def get_last_checkpoint(folder, signal_folder=None, uc_async_save=False):
     content = os.listdir(folder)
     checkpoints = [
         path
@@ -141,7 +270,35 @@ def get_last_checkpoint(folder):
     ]
     if len(checkpoints) == 0:
         return
-    return os.path.join(folder, max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])))
+
+    if uc_async_save:
+        assert signal_folder is not None
+
+    if strtobool(os.getenv("FLAG_LLM_PDC", "False")):
+        for i in sorted(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0]), reverse=True):
+            current_path = os.path.join(folder, i)
+            # make sure the checkpoint is valid
+            if not uc_async_save:
+                if os.path.exists(os.path.join(current_path, ".checkpoint_done")):
+                    return current_path
+            else:
+                saving_info = paddle.load(distributed_file(os.path.join(current_path, ".saving_info")))
+                current_signal_path = os.path.join(signal_folder, i)
+                pre_world_size = saving_info.get("world_size", 1)
+                ignore_save_lr_and_optim = saving_info.get("ignore_save_lr_and_optim", False)
+                skip_save_model_weight = saving_info.get("skip_save_model_weight", False)
+                remove_master_weight = saving_info.get("remove_master_weight", False)
+                if _check_checkpoint_files(
+                    current_signal_path,
+                    pre_world_size,
+                    ignore_save_lr_and_optim,
+                    skip_save_model_weight,
+                    remove_master_weight,
+                ):
+                    return current_path
+        return
+    else:
+        return os.path.join(folder, max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])))
 
 
 class IntervalStrategy(ExplicitEnum):
@@ -163,6 +320,7 @@ class OptimizerNames(ExplicitEnum):
 
     ADAMW = "adamw"
     ADAFACTOR = "adafactor"
+    ADAMW_MINI = "adamw_mini"
 
 
 class ShardingOption(ExplicitEnum):
@@ -201,7 +359,7 @@ def total_processes_number(local_rank):
     return 1
 
 
-def speed_metrics(split, start_time, num_samples=None, num_steps=None):
+def speed_metrics(split, start_time, num_samples=None, num_steps=None, seq_length=None, model_flops=None):
     """
     Measure and return speed performance metrics.
 
@@ -218,10 +376,18 @@ def speed_metrics(split, start_time, num_samples=None, num_steps=None):
     result = {f"{split}_runtime": round(runtime, 4)}
     if num_samples is not None:
         samples_per_second = num_samples / runtime
-        result[f"{split}_samples_per_second"] = round(samples_per_second, 3)
+        result[f"{split}_samples_per_second"] = round(samples_per_second, 4)
+        if seq_length is not None:
+            tokens_per_second_per_device = samples_per_second * seq_length / paddle.distributed.get_world_size()
+            result[f"{split}_tokens_per_second_per_device"] = round(tokens_per_second_per_device, 4)
+        if model_flops is not None:
+            result[f"{split}_hardware_tflops_per_device"] = round(
+                tokens_per_second_per_device * model_flops / seq_length / 2**40, 2
+            )
+
     if num_steps is not None:
         steps_per_second = num_steps / runtime
-        result[f"{split}_steps_per_second"] = round(steps_per_second, 3)
+        result[f"{split}_steps_per_second"] = round(steps_per_second, 4)
     return result
 
 
@@ -394,6 +560,9 @@ def get_scheduler(
     learning_rate: float,
     num_warmup_steps: Optional[int] = None,
     num_training_steps: Optional[int] = None,
+    num_cycles: Optional[float] = 0.5,
+    lr_end: Optional[float] = 1e-7,
+    power: Optional[float] = 1.0,
 ):
     """
     Unified API to get any scheduler from its name.
@@ -408,6 +577,15 @@ def get_scheduler(
         num_training_steps (`int``, *optional*):
             The number of training steps to do. This is not required by all schedulers (hence the argument being
             optional), the function will raise an error if it's unset and the scheduler type requires it.
+        num_cycles (``float``, *optional*):
+            The number of waves in the cosine scheduler (the defaults is to just decrease from the max value to 0
+            following a half-cosine). This is not required by all schedulers (hence the argument being optional)
+        lr_end (``float``, *optional*):
+            The end LR in the polynomial scheduler. This is not required by all schedulers (hence the argument
+            being optional).
+        power (``float``, *optional*):
+            The power factor in the polynomial scheduler. This is not required by all schedulers (hence the argument
+            being optional).
     """
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
@@ -424,6 +602,23 @@ def get_scheduler(
     # All other schedulers require `num_training_steps`
     if num_training_steps is None:
         raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
+
+    if name == SchedulerType.COSINE:
+        return schedule_func(
+            learning_rate,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            num_cycles=num_cycles,
+        )
+
+    if name == SchedulerType.POLYNOMIAL:
+        return schedule_func(
+            learning_rate,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            lr_end=lr_end,
+            power=power,
+        )
 
     return schedule_func(learning_rate, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
@@ -639,7 +834,7 @@ class TrainerMemoryTracker:
         gc.collect()
 
         if self.paddle is not None:
-            # self.torch.cuda.reset_peak_memory_stats()?
+            # self.paddle.cuda.reset_peak_memory_stats()?
             self.paddle.device.cuda.empty_cache()
 
         # gpu
@@ -707,6 +902,10 @@ class TrainerMemoryTracker:
         if self.cur_stage is not None and self.cur_stage != stage:
             return
 
+        if hasattr(self, "gpu_mem_used_peak"):
+            metrics["gpu_mem_max_memory_allocated"] = self.gpu_mem_used_peak
+            metrics["gpu_mem_max_memory_reserved"] = self.paddle.device.cuda.max_memory_reserved()
+
         # since we don't have a way to return init metrics, we push them into the first of train/val/predict
         stages = [stage]
         if not self.init_reported:
@@ -723,7 +922,7 @@ class TrainerMemoryTracker:
             # for t in ["begin", "end"]:
             #     if stage in self.cpu and t in self.cpu[stage]:
             #         metrics[f"{stage}_mem_cpu_{t}"] = self.cpu[stage][t]
-            #     if self.torch is not None and stage in self.gpu and t in self.gpu[stage]:
+            #     if self.paddle is not None and stage in self.gpu and t in self.gpu[stage]:
             #         metrics[f"{stage}_mem_gpu_{t}"] = self.gpu[stage][t]
 
         # since memory can be allocated before init, and it might be difficult to track overall
@@ -736,7 +935,7 @@ class TrainerMemoryTracker:
             # whatever the next stage was we could also report this:
             # if self.cpu["init"]["end"] != self.cpu[stage]["begin"]:
             #     metrics[f"after_init_mem_cpu_delta"] = self.cpu[stage]["begin"] - self.cpu["init"]["end"]
-            # if self.torch is not None and self.gpu["init"]["end"] != self.gpu[stage]["begin"]:
+            # if self.paddle is not None and self.gpu["init"]["end"] != self.gpu[stage]["begin"]:
             #     metrics[f"after_init_mem_gpu_delta"] = self.gpu[stage]["begin"] - self.gpu["init"]["end"]
 
     def stop_and_update_metrics(self, metrics=None):
@@ -845,6 +1044,66 @@ class IterableDatasetShard(IterableDataset):
             return math.ceil(len(self.dataset) / (self.batch_size * self.num_processes)) * self.batch_size
 
 
+class LastBatchPaddingSampler(paddle.io.DistributedBatchSampler):
+    """The sampler which pads the first batch to the last batch"""
+
+    def __iter__(self):
+        local_batch_size = self.batch_size * self._acc_steps
+        num_samples = len(self.dataset)
+        indices = np.arange(num_samples).tolist()
+        global_eval_batch_size = self.batch_size * self.nranks
+        last_batch_size = num_samples % global_eval_batch_size
+
+        # Padding the first batch if the last batch is not full
+        if last_batch_size > 0:
+            padding_size = global_eval_batch_size - last_batch_size
+            # Select the first batch of indices for padding
+            if global_eval_batch_size <= len(indices):
+                first_batch_idx = indices[:global_eval_batch_size]
+            else:
+                first_batch_idx = indices.copy()
+            while padding_size > 0:
+                # Repeatedly pad the indices until the padding size is fulfilled
+                if padding_size > len(first_batch_idx):
+                    indices += first_batch_idx
+                    padding_size -= len(first_batch_idx)
+                else:
+                    indices += first_batch_idx[:padding_size]
+                    padding_size = 0
+
+        # Update the total number of indices
+        self.total_size = len(indices)
+        if self.shuffle:
+            np.random.RandomState(self.epoch).shuffle(indices)
+            self.epoch += 1
+
+        # subsample
+        def _get_indices_by_batch_size(indices):
+            subsampled_indices = []
+            # Iterate over the indices and extract batches that belong to the current device
+            for i in range(
+                self.local_rank * self.batch_size,
+                len(indices),
+                self.batch_size * self.nranks,
+            ):
+                subsampled_indices.extend(indices[i : i + self.batch_size])
+
+            return subsampled_indices
+
+        if self.nranks > 1:
+            indices = _get_indices_by_batch_size(indices)
+
+        _sample_iter = iter(indices)
+        batch_indices = []
+        for idx in _sample_iter:
+            batch_indices.append(idx)
+            if len(batch_indices) == local_batch_size:
+                yield batch_indices
+                batch_indices = []
+        # Ensure that there are no leftover indices after batching
+        assert len(batch_indices) == 0
+
+
 def find_batch_size(tensors):
     """
     Find the first dimension of a tensor in a nested list/tuple/dict of tensors.
@@ -917,7 +1176,72 @@ def set_hyrbid_parallel_seed(basic_seed, dataset_rank, tp_rank, pp_rank=0):
 
     tracker = get_rng_state_tracker()
 
-    if "global_seed" not in tracker.states_:
+    if "global_seed" not in tracker.states_ and global_seed not in tracker.seeds_:
         tracker.add("global_seed", global_seed)
-    if "local_seed" not in tracker.states_:
+    if "local_seed" not in tracker.states_ and local_seed not in tracker.seeds_:
         tracker.add("local_seed", local_seed)
+
+
+def should_skip_data(global_step, skip_data_intervals):
+    """Whether to skip current step data"""
+
+    if skip_data_intervals is None:
+        return False
+    skip_flag = False
+    for interval in skip_data_intervals:
+        if len(interval) != 2 or interval[0] > interval[1] or interval[0] <= 0:
+            raise ValueError(f"Please check your skip interval {interval}")
+        start_global_step, end_global_step = interval[0], interval[1]
+        # start_global_step and end_global_step start from 1, while global_step start from 0
+        if start_global_step <= global_step + 1 <= end_global_step:
+            skip_flag = True
+            break
+    return skip_flag
+
+
+def split_parallel_config(parallel_config):
+    if "," in parallel_config:
+        parallel_config = set(parallel_config.split(","))
+    else:
+        parallel_config = set(parallel_config.split(" "))
+    return parallel_config
+
+
+def download_recovery_ckpt_from_pdc(recovery_checkpoint_path, timeout):
+    """Download checkpoint from PDC for resuming training after failover. Longjob envrionment is necessary.
+
+    Args:
+        recovery_checkpoint_path (`str`):
+            local path to load checkpoint for training recovery
+        timeout (`int`):
+            max wait time for download
+    """
+
+    try:
+        base_dir, download_dir = os.path.split(os.path.normpath(recovery_checkpoint_path))
+        if not os.path.exists(base_dir) and base_dir != "":
+            os.makedirs(base_dir, exist_ok=True)
+        download_step = int(_re_checkpoint.search(download_dir).groups()[0])
+    except Exception as e:
+        raise RuntimeError(f"{PDC_DOWNLOAD_ERROR}; Failed to parse checkpoint path, details: {e}")
+    start_time = time.time()
+    # TODO(@gexiao): temporary workaround for environment variable conflicts.
+    original_trainer_id = os.getenv("PADDLE_TRAINER_ID")
+    original_trainers_num = os.getenv("PADDLE_TRAINERS_NUM")
+    cards_per_node = int(os.getenv("PADDLE_LOCAL_SIZE", "8"))
+    os.environ["PADDLE_TRAINER_ID"] = str(dist.get_rank() // cards_per_node)
+    os.environ["PADDLE_TRAINERS_NUM"] = str(dist.get_world_size() // cards_per_node)
+    result = pdc_tool.pdc_download_checkpoint(download_step, timeout)
+    os.environ["PADDLE_TRAINER_ID"] = original_trainer_id
+    os.environ["PADDLE_TRAINERS_NUM"] = original_trainers_num
+    end_time = time.time()
+    if result == PDCErrorCode.Success:
+        logger.info(f"Successfully downloaded checkpoint from PDC, total time cost: {end_time - start_time} seconds.")
+    elif result == PDCErrorCode.LocalPathExist:
+        logger.warning(
+            f"Skipping download checkpoint since file exists at local, total time cost: {end_time - start_time} seconds."
+        )
+    else:
+        raise RuntimeError(
+            f"{PDC_DOWNLOAD_ERROR}; Error occurred when trying to download checkpoint from PDC, recovery_checkpoint_path: {recovery_checkpoint_path}, timeout: {timeout}; error details: {PDCErrorMessageMap[result]}"
+        )
